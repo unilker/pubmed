@@ -3,6 +3,8 @@
 """
 app.py — PubMed / Europe PMC yayın sayımı (metabolit × biyoakışkan)
 
+Arayüz dört dilde çalışır (tr, en, de, fr); metinler locales/ altındadır.
+
 Çalıştırma:
     pip install -r requirements.txt
     streamlit run app.py
@@ -20,13 +22,11 @@ import pandas as pd
 import streamlit as st
 from openpyxl.styles import Alignment, Font
 
-from backends import (
-    MATRIX_LABELS,
-    EuropePMCBackend,
-    PubMedBackend,
-    guess_matrix_key,
-)
+import i18n
+from backends import MATRIX_KEYS, EuropePMCBackend, PubMedBackend, guess_matrix_key
+from branding import find_logo, header, page_icon
 from cache import CountCache
+from i18n import t
 
 # ----------------------------------------------------------------- sayfa düzeni
 SHEET_COLS = {"metabolite_en": 3, "count": 5, "query": 8}
@@ -103,10 +103,36 @@ def spearman(a: pd.Series, b: pd.Series):
 
 
 def topn_overlap(df, col_a, col_b, n):
-    """İki kaynağın ilk n metaboliti ne kadar örtüşüyor."""
-    top_a = set(df.nlargest(n, col_a)["Metabolit"])
-    top_b = set(df.nlargest(n, col_b)["Metabolit"])
+    top_a = set(df.nlargest(n, col_a)["metabolite"])
+    top_b = set(df.nlargest(n, col_b)["metabolite"])
     return len(top_a & top_b), sorted(top_a ^ top_b)
+
+
+def backend_label(backend) -> str:
+    """Arka ucun durumunu seçili dilde anlatır."""
+    info = backend.info()
+    if info["name"] == "PubMed":
+        return t("backend.pubmed_keyed") if info.get("keyed") else t("backend.pubmed_nokey")
+    return t(
+        "backend.epmc",
+        state=t("state.on") if info.get("synonym") else t("state.off"),
+        medline=t("backend.medline_suffix") if info.get("medline") else "",
+    )
+
+
+# Önizleme tablosunun sütun adları dilden bağımsız tutulur; çeviri yalnızca
+# gösterim anında uygulanır. Aksi hâlde koşudan sonra dil değiştirilince
+# session_state'teki tablo ile arama anahtarları uyuşmaz.
+def col_count(name):  return f"{name}|count"
+def col_rank(name):   return f"{name}|rank"
+
+
+def display_df(df: pd.DataFrame, names) -> pd.DataFrame:
+    mapping = {"metabolite": t("col.metabolite"), "delta_rank": t("col.delta")}
+    for name in names:
+        mapping[col_count(name)] = f"{name} {t('col.count')}"
+        mapping[col_rank(name)] = f"{name} {t('col.rank')}"
+    return df.rename(columns=mapping)
 
 
 # ------------------------------------------------------------------ ana işleyiş
@@ -156,15 +182,16 @@ def run_counts(wb, sheet_map, synonyms, backends, primary, opts, cache):
                 rec["counts"][b.name] = cnt
                 rec["queries"][b.name] = q
                 log_rows.append([stamp, sheet, met, b.name, cnt,
-                                 "evet" if from_cache else "hayır", fetched, q])
+                                 "yes" if from_cache else "no", fetched, q])
 
                 done += 1
                 bar.progress(min(done / total, 1.0) if total else 1.0)
-                status.write(
-                    f"`{sheet}` · {met} · {b.name} → "
-                    f"**{cnt if cnt is not None else 'HATA'}**"
-                    f"{' (önbellek)' if from_cache else ''} — {done}/{total}"
-                )
+                status.write(t(
+                    "progress.line", sheet=sheet, metabolite=met, backend=b.name,
+                    count=cnt if cnt is not None else t("progress.error"),
+                    cached=t("progress.cached") if from_cache else "",
+                    done=done, total=total,
+                ))
 
             records.append(rec)
             r += 1
@@ -173,10 +200,8 @@ def run_counts(wb, sheet_map, synonyms, backends, primary, opts, cache):
 
     bar.empty()
     status.empty()
-    return {
-        "log": log_rows, "previews": previews, "errors": errors,
-        "stamp": stamp, "hits": hits, "misses": misses,
-    }
+    return {"log": log_rows, "previews": previews, "errors": errors,
+            "stamp": stamp, "hits": hits, "misses": misses}
 
 
 def _finalise_sheet(ws, records, backends, primary, opts):
@@ -189,25 +214,26 @@ def _finalise_sheet(ws, records, backends, primary, opts):
                                       else rec["counts"][primary.name]), reverse=True)
 
     df = pd.DataFrame({
-        "Metabolit": [rec["met"] for rec in records],
-        **{f"{b.name} sayı": [rec["counts"].get(b.name) for rec in records]
+        "metabolite": [rec["met"] for rec in records],
+        **{col_count(b.name): [rec["counts"].get(b.name) for rec in records]
            for b in backends},
     })
     for b in backends:
-        df[f"{b.name} sıra"] = df[f"{b.name} sayı"].rank(
+        df[col_rank(b.name)] = df[col_count(b.name)].rank(
             ascending=False, method="min").astype("Int64")
     if len(backends) == 2:
-        a, c = backends[0].name, backends[1].name
-        df["Δ sıra"] = (df[f"{a} sıra"] - df[f"{c} sıra"]).abs()
+        first, second = backends[0].name, backends[1].name
+        df["delta_rank"] = (df[col_rank(first)] - df[col_rank(second)]).abs()
 
-    total_cnt = sum(v for v in df[f"{primary.name} sayı"] if pd.notna(v))
+    total_cnt = sum(v for v in df[col_count(primary.name)] if pd.notna(v))
     last = HEADER_ROW + len(records)
     secondary = [b for b in backends if b.name != primary.name]
 
     if secondary:
         sec = secondary[0].name
-        for offset, label in enumerate([f"{sec} sayı", f"{sec} sıra",
-                                        f"{primary.name} sıra", "Δ sıra"]):
+        labels = [f"{sec} {t('col.count')}", f"{sec} {t('col.rank')}",
+                  f"{primary.name} {t('col.rank')}", t("col.delta")]
+        for offset, label in enumerate(labels):
             cell = ws.cell(HEADER_ROW, EXTRA_COL + offset, value=label)
             cell.font = Font(name="Arial", size=9, bold=True)
             cell.alignment = Alignment(vertical="center", horizontal="center",
@@ -243,9 +269,10 @@ def _finalise_sheet(ws, records, backends, primary, opts):
             row = df.iloc[i - 1]
             for offset, v in enumerate([
                 rec["counts"].get(sec),
-                None if pd.isna(row[f"{sec} sıra"]) else int(row[f"{sec} sıra"]),
-                None if pd.isna(row[f"{primary.name} sıra"]) else int(row[f"{primary.name} sıra"]),
-                None if pd.isna(row.get("Δ sıra")) else int(row["Δ sıra"]),
+                None if pd.isna(row[col_rank(sec)]) else int(row[col_rank(sec)]),
+                None if pd.isna(row[col_rank(primary.name)])
+                else int(row[col_rank(primary.name)]),
+                None if pd.isna(row.get("delta_rank")) else int(row["delta_rank"]),
             ]):
                 cell = ws.cell(rr, EXTRA_COL + offset, value=v)
                 cell.font = Font(name="Arial", size=9)
@@ -256,12 +283,14 @@ def _finalise_sheet(ws, records, backends, primary, opts):
 
 
 # ------------------------------------------------------------------------ arayüz
-st.set_page_config(page_title="Metabolit Literatür Sayımı", page_icon="🧪", layout="wide")
-st.title("🧪 Literatür sayımı — metabolit × biyoakışkan")
-st.caption(
-    "PubMed (E-utilities) ve Europe PMC üzerinden yayın sayısı çeker, "
-    "sonuçları çalışma kitabına yazar ve iki kaynağın sıralamasını karşılaştırır."
+i18n.current()  # dili set_page_config'ten önce çöz
+_logo = find_logo()
+st.set_page_config(
+    page_title=t("app.title"),
+    page_icon=page_icon(_logo),
+    layout="wide",
 )
+header(t("app.title"), t("app.caption"), logo=_logo)
 
 ss = st.session_state
 for k, v in {"out_xlsx": None, "out_log": None, "res": None,
@@ -269,154 +298,151 @@ for k, v in {"out_xlsx": None, "out_log": None, "res": None,
     ss.setdefault(k, v)
 
 with st.sidebar:
-    st.header("Kaynak")
-    mode = st.radio(
-        "Sayım kaynağı", ["PubMed", "Europe PMC", "İkisi (karşılaştırma)"],
-        index=0, label_visibility="collapsed",
-    )
-    both = mode.startswith("İkisi")
+    i18n.selector()
+    st.divider()
+
+    st.header(t("source.header"))
+    modes = ["PubMed", "Europe PMC", t("source.mode.both")]
+    mode = st.radio(t("source.mode_label"), modes, index=0,
+                    label_visibility="collapsed", key="mode")
+    both = mode == modes[2]
+    use_pm = mode != "Europe PMC"
+    use_ep = mode != "PubMed"
+
     primary_name = "PubMed"
     if both:
-        primary_name = st.selectbox(
-            "Çalışma kitabına yazılacak kaynak", ["PubMed", "Europe PMC"],
-            help="E sütununu, yüzdeyi ve sıralamayı bu kaynak belirler. "
-                 "Diğeri I sütunundan itibaren yazılır.",
-        )
+        primary_name = st.selectbox(t("source.primary"), ["PubMed", "Europe PMC"],
+                                    help=t("source.primary_help"), key="primary")
 
-    if mode != "Europe PMC":
+    if use_pm:
         st.subheader("PubMed")
-        api_key = st.text_input("API anahtarı (isteğe bağlı)", type="password",
-                                value=secret("NCBI_API_KEY"))
-        email = st.text_input("İletişim e-postası")
-        tool = st.text_input("tool adı", value="met4metab-count")
-        pm_delay = st.number_input(
-            "İstekler arası (s)", 0.05, 5.0,
-            0.11 if api_key else 0.40, step=0.01, format="%.2f",
-            help="Anahtarsız sınır 3 istek/s. 0,40 s güvenli tarafta kalır.",
-        )
+        api_key = st.text_input(t("pubmed.api_key"), type="password",
+                                value=secret("NCBI_API_KEY"), key="pm_key")
+        email = st.text_input(t("pubmed.email"), key="pm_mail")
+        tool = st.text_input(t("pubmed.tool"), value="met4metab-count", key="pm_tool")
+        pm_delay = st.number_input(t("pubmed.delay"), 0.05, 5.0,
+                                   0.11 if api_key else 0.40, step=0.01,
+                                   format="%.2f", help=t("pubmed.delay_help"),
+                                   key="pm_delay")
         if not api_key:
-            st.caption("Anahtarsız çalışıyor — 3 istek/s sınırı geçerli.")
+            st.caption(t("pubmed.nokey"))
     else:
         api_key = email = tool = ""
         pm_delay = 0.40
 
-    if mode != "PubMed":
+    if use_ep:
         st.subheader("Europe PMC")
-        st.caption("Anahtar veya kayıt gerektirmez.")
-        epmc_synonym = st.checkbox(
-            "MeSH eşanlamlı genişletmesi", value=False,
-            help="Açıkken sayım kendi SYNONYMS sözlüğünüze izlenebilir olmaktan çıkar.",
-        )
-        epmc_medline = st.checkbox(
-            "SRC:MED ile MEDLINE alt kümesine indir", value=True,
-            help="PubMed ile karşılaştırılabilirlik için önerilir.",
-        )
-        human_filter = st.text_input(
-            "İnsan filtresi", value='MESH_TERMS:"Humans"',
-            help="Alan adını Advanced Search Query Builder ile doğrulayın; "
-                 "boş bırakılırsa filtre uygulanmaz.",
-        )
-        epmc_delay = st.number_input("İstekler arası (s) ", 0.05, 5.0, 0.20,
-                                     step=0.01, format="%.2f")
+        st.caption(t("epmc.note"))
+        epmc_synonym = st.checkbox(t("epmc.synonym"), value=False,
+                                   help=t("epmc.synonym_help"), key="ep_syn")
+        epmc_medline = st.checkbox(t("epmc.medline"), value=True,
+                                   help=t("epmc.medline_help"), key="ep_med")
+        human_filter = st.text_input(t("epmc.human_filter"), value='MESH_TERMS:"Humans"',
+                                     help=t("epmc.human_filter_help"), key="ep_hf")
+        epmc_delay = st.number_input(t("epmc.delay"), 0.05, 5.0, 0.20, step=0.01,
+                                     format="%.2f", key="ep_delay")
     else:
         epmc_synonym, epmc_medline, epmc_delay = False, True, 0.20
         human_filter = 'MESH_TERMS:"Humans"'
 
     st.divider()
-    st.header("Sorgu")
-    use_years = st.checkbox("Yayın yılı aralığı uygula")
+    st.header(t("query.header"))
+    use_years = st.checkbox(t("query.use_years"), key="use_years")
     from_year = to_year = None
     if use_years:
         c1, c2 = st.columns(2)
-        from_year = c1.number_input("Başlangıç", 1800, 2100, 2010, step=1)
-        to_year = c2.number_input("Bitiş", 1800, 2100, _dt.date.today().year, step=1)
+        from_year = c1.number_input(t("query.from"), 1800, 2100, 2010, step=1, key="y0")
+        to_year = c2.number_input(t("query.to"), 1800, 2100,
+                                  _dt.date.today().year, step=1, key="y1")
 
     st.divider()
-    st.header("Önbellek")
-    use_cache = st.checkbox("Kalıcı önbelleği kullan", value=True)
-    cache_path = st.text_input("Dosya", value=os.environ.get("COUNT_CACHE",
-                                                            "pubmed_cache.sqlite"))
-    ttl = st.number_input("Geçerlilik (gün)", 0, 3650, 30, step=1,
-                          help="0 = her sorgu yeniden çekilir.")
+    st.header(t("cache.header"))
+    use_cache = st.checkbox(t("cache.use"), value=True, key="use_cache")
+    cache_path = st.text_input(t("cache.file"),
+                               value=os.environ.get("COUNT_CACHE", "pubmed_cache.sqlite"),
+                               key="cache_path")
+    ttl = st.number_input(t("cache.ttl"), 0, 3650, 30, step=1,
+                          help=t("cache.ttl_help"), key="ttl")
     cache_obj = get_cache(cache_path) if use_cache else None
     if cache_obj:
-        st.caption(f"{cache_obj.total()} kayıt")
+        st.caption(t("cache.records", n=cache_obj.total()))
         if cache_obj.total():
-            st.dataframe(pd.DataFrame(cache_obj.stats()), hide_index=True)
+            stats = pd.DataFrame(cache_obj.stats()).rename(columns={
+                "backend": t("cache.col.backend"), "records": t("cache.col.records"),
+                "oldest": t("cache.col.oldest"), "newest": t("cache.col.newest"),
+            })
+            st.dataframe(stats, hide_index=True)
         cc1, cc2 = st.columns(2)
-        if cc1.button("Temizle", use_container_width=True):
-            n = cache_obj.clear()
-            st.toast(f"{n} kayıt silindi.")
+        if cc1.button(t("cache.clear"), use_container_width=True, key="cache_clear"):
+            st.toast(t("cache.cleared", n=cache_obj.clear()))
             st.rerun()
-        cc2.download_button("Dışa aktar", cache_obj.export_csv(),
+        cc2.download_button(t("cache.export"), cache_obj.export_csv(),
                             file_name="count_cache.csv", mime="text/csv",
-                            use_container_width=True)
-        imp = st.file_uploader("Önbellek içe aktar (CSV)", type=["csv"],
-                               key="cache_import")
-        if imp is not None and st.button("İçe aktar", use_container_width=True):
-            n = cache_obj.import_csv(imp.getvalue())
-            st.toast(f"{n} kayıt alındı.")
+                            use_container_width=True, key="cache_export")
+        imp = st.file_uploader(t("cache.import_label"), type=["csv"], key="cache_import")
+        if imp is not None and st.button(t("cache.import"), use_container_width=True,
+                                         key="cache_import_btn"):
+            st.toast(t("cache.imported", n=cache_obj.import_csv(imp.getvalue())))
             st.rerun()
-        st.caption("Streamlit Cloud'da dosya sistemi kalıcı değildir — "
-                   "koşu sonrası önbelleği dışa aktarın.")
+        st.caption(t("cache.cloud_note"))
 
     st.divider()
-    st.header("Çıktı")
-    do_sort = st.checkbox("Satırları sayıya göre sırala", value=True)
-    pct_value = st.checkbox("Yüzdeyi değer olarak yaz", value=True)
-    topn = st.number_input("Örtüşme için ilk N", 5, 200, 20, step=5)
+    st.header(t("output.header"))
+    do_sort = st.checkbox(t("output.sort"), value=True, key="sort")
+    pct_value = st.checkbox(t("output.pct_value"), value=True,
+                            help=t("output.pct_help"), key="pct")
+    topn = st.number_input(t("output.topn"), 5, 200, 20, step=5, key="topn")
 
 # arka uçları kur
 backends = []
-if mode != "Europe PMC":
+if use_pm:
     backends.append(PubMedBackend(api_key or None, email or None,
                                   tool or "met4metab-count", pm_delay))
-if mode != "PubMed":
+if use_ep:
     backends.append(EuropePMCBackend(epmc_delay, epmc_synonym, epmc_medline,
                                      human_filter, email or None))
 primary = next((b for b in backends if b.name == primary_name), backends[0])
 
-st.info(" · ".join(b.describe() for b in backends) +
-        (f"  →  çalışma kitabına **{primary.name}** yazılacak" if both else ""))
+st.info(" · ".join(backend_label(b) for b in backends) +
+        (t("info.primary", name=primary.name) if both else ""))
 
-with st.expander("Eşanlamlı sözlüğü (JSON)"):
+with st.expander(t("syn.expander")):
     syn_text = st.text_area("SYNONYMS", json.dumps(SYNONYMS, ensure_ascii=False, indent=2),
-                            height=240, label_visibility="collapsed")
+                            height=240, label_visibility="collapsed", key="syn")
     try:
         synonyms = json.loads(syn_text)
-        st.caption(f"✅ {len(synonyms)} giriş.")
+        st.caption(t("syn.count", n=len(synonyms)))
     except json.JSONDecodeError as exc:
         synonyms = SYNONYMS
-        st.error(f"JSON hatası, varsayılan sözlük kullanılacak: {exc}")
+        st.error(t("syn.error", err=exc))
 
-uploaded = st.file_uploader("Çalışma kitabı (.xlsx)", type=["xlsx"])
+uploaded = st.file_uploader(t("upload.label"), type=["xlsx"], key="workbook")
 
 if uploaded is None:
-    st.caption("Beklenen düzen: başlık 4. satırda, C = metabolit (EN), "
-               "E = sayı, F = pay, H = sorgu.")
+    st.caption(t("upload.hint"))
 else:
     raw = uploaded.getvalue()
     probe = openpyxl.load_workbook(io.BytesIO(raw))
     auto = [s for s in dict.fromkeys(MATRIX_SHEETS) if s in probe.sheetnames]
-    chosen = st.multiselect("İşlenecek sayfalar", probe.sheetnames,
-                            default=auto or probe.sheetnames)
+    chosen = st.multiselect(t("sheets.label"), probe.sheetnames,
+                            default=auto or probe.sheetnames, key="sheets")
 
     sheet_map = {}
     if chosen:
-        with st.expander("Matris eşleştirmesi", expanded=not auto):
-            keys = list(MATRIX_LABELS)
+        with st.expander(t("matrix.expander"), expanded=not auto):
             for s in chosen:
-                idx = keys.index(guess_matrix_key(s))
-                pick = st.selectbox(s, keys, index=idx, key=f"mx_{s}",
-                                    format_func=lambda k: MATRIX_LABELS[k])
+                pick = st.selectbox(s, MATRIX_KEYS,
+                                    index=MATRIX_KEYS.index(guess_matrix_key(s)),
+                                    format_func=lambda k: t(f"matrix.{k}"),
+                                    key=f"mx_{s}")
                 sheet_map[s] = pick
 
         rows = sum(sheet_row_count(probe[s]) for s in chosen)
         eta = rows * sum(b.limiter.min_interval for b in backends)
-        st.caption(f"{len(chosen)} sayfa · {rows * len(backends)} sorgu · "
-                   f"önbelleksiz tahmini süre ≈ {eta / 60:.1f} dk")
+        st.caption(t("eta", sheets=len(chosen), queries=rows * len(backends),
+                     minutes=f"{eta / 60:.1f}"))
 
-    if st.button("▶️ Sayımı başlat", type="primary", disabled=not chosen):
+    if st.button(t("run.button"), type="primary", disabled=not chosen, key="run"):
         wb = openpyxl.load_workbook(io.BytesIO(raw))
         res = run_counts(
             wb, sheet_map, synonyms, backends, primary,
@@ -432,6 +458,8 @@ else:
 
         sio = io.StringIO()
         w = csv.writer(sio)
+        # log başlıkları bilinçli olarak İngilizce: makine tarafından okunan,
+        # dilden bağımsız bir yeniden üretilebilirlik kaydı
         w.writerow(["run_timestamp", "sheet", "metabolite", "backend",
                     "count", "from_cache", "fetched_at", "query"])
         w.writerows(res["log"])
@@ -442,73 +470,67 @@ else:
 # ------------------------------------------------------------------- sonuçlar
 res = ss.res
 if res and ss.out_xlsx:
-    st.success(
-        f"Tamamlandı — {res['stamp']} · {res['misses']} istek, "
-        f"{res['hits']} önbellekten"
-    )
+    st.success(t("result.success", stamp=res["stamp"],
+                 requests=res["misses"], cached=res["hits"]))
     if res["errors"]:
-        with st.expander(f"⚠️ {len(res['errors'])} başarısız sorgu"):
+        with st.expander(t("result.errors", n=len(res["errors"]))):
             for e in res["errors"]:
                 st.write("- " + e)
 
     c1, c2 = st.columns(2)
-    c1.download_button("⬇️ Çalışma kitabı", ss.out_xlsx, file_name=ss.out_name,
+    c1.download_button(t("dl.workbook"), ss.out_xlsx, file_name=ss.out_name,
                        mime="application/vnd.openxmlformats-officedocument."
-                            "spreadsheetml.sheet", use_container_width=True)
-    c2.download_button("⬇️ Log (CSV)", ss.out_log, file_name="count_log.csv",
-                       mime="text/csv", use_container_width=True)
+                            "spreadsheetml.sheet", use_container_width=True,
+                       key="dl_wb")
+    c2.download_button(t("dl.log"), ss.out_log, file_name="count_log.csv",
+                       mime="text/csv", use_container_width=True, key="dl_log")
 
     names = ss.backend_names
     for tab, (sheet, df) in zip(st.tabs(list(res["previews"])),
                                 res["previews"].items()):
         with tab:
             if df.empty:
-                st.warning("Bu sayfada veri bulunamadı.")
+                st.warning(t("sheet.empty"))
                 continue
-            st.dataframe(df, use_container_width=True, hide_index=True)
+            shown = display_df(df, names)
+            st.dataframe(shown, use_container_width=True, hide_index=True)
 
             if len(names) == 2:
                 a, b = names
-                ca, cb = f"{a} sayı", f"{b} sayı"
-                rho = spearman(df[ca], df[cb])
+                rho = spearman(df[col_count(a)], df[col_count(b)])
                 n = min(int(topn), len(df))
-                shared, diff = topn_overlap(df, ca, cb, n)
+                shared, diff = topn_overlap(df, col_count(a), col_count(b), n)
 
-                st.subheader("Kaynak karşılaştırması")
+                st.subheader(t("cmp.header"))
                 m1, m2, m3 = st.columns(3)
-                m1.metric("Spearman ρ", f"{rho:.3f}" if rho is not None else "—")
-                m2.metric(f"İlk {n} örtüşmesi", f"{shared}/{n}")
-                m3.metric("En büyük Δ sıra",
-                          int(df["Δ sıra"].max()) if df["Δ sıra"].notna().any() else "—")
+                m1.metric(t("cmp.spearman"), f"{rho:.3f}" if rho is not None else "—")
+                m2.metric(t("cmp.overlap", n=n), f"{shared}/{n}")
+                m3.metric(t("cmp.maxdelta"),
+                          int(df["delta_rank"].max())
+                          if df["delta_rank"].notna().any() else "—")
 
-                st.scatter_chart(df, x=f"{a} sıra", y=f"{b} sıra")
+                st.scatter_chart(shown, x=f"{a} {t('col.rank')}",
+                                 y=f"{b} {t('col.rank')}")
                 if diff:
-                    st.caption("Yalnızca tek kaynakta ilk %d'e girenler: %s"
-                               % (n, ", ".join(diff)))
-                st.caption(
-                    "ρ yüksekse metabolit seçimi veri tabanı seçimine duyarlı "
-                    "değildir; bu, tek bir sayım listesinden daha savunulabilir "
-                    "bir ifadedir."
-                )
+                    st.caption(t("cmp.only_one", n=n, items=", ".join(diff)))
+                st.caption(t("cmp.note"))
             else:
-                col = f"{names[0]} sayı"
+                col = col_count(names[0])
                 if df[col].notna().any():
-                    st.bar_chart(df.head(20).set_index("Metabolit")[col])
+                    st.bar_chart(df.head(20).set_index("metabolite")[col])
 
 # --------------------------------------------------------------- tek sorgu testi
-with st.expander("🔍 Tek sorgu testi"):
-    tb_name = st.selectbox("Kaynak", [b.name for b in backends], key="test_backend")
+with st.expander(t("test.expander")):
+    tb_name = st.selectbox(t("test.backend"), [b.name for b in backends],
+                           key="test_backend")
     tb = next(b for b in backends if b.name == tb_name)
     default_q = tb.build_query("Citrate", "urine", SYNONYMS, from_year, to_year)
-    tq = st.text_area("Sorgu", value=default_q, height=110, key="test_query")
-    if st.button("Çalıştır", key="test_run"):
+    tq = st.text_area(t("test.query"), value=default_q, height=110, key="test_query")
+    if st.button(t("test.run"), key="test_run"):
         cnt, err = tb.count(tq)
         if err:
             st.error(err)
         else:
-            st.metric("Sonuç sayısı", f"{cnt:,}".replace(",", "."))
+            st.metric(t("test.result"), f"{cnt:,}".replace(",", " "))
 
-st.caption(
-    "Sayımlar sorguya ve tarihe duyarlıdır. Log dosyası her satır için kaynağı, "
-    "sorguyu ve çekilme zamanını taşır; rapora bu üçü birlikte girer."
-)
+st.caption(t("footer"))
