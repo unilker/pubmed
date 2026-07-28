@@ -3,7 +3,20 @@
 import io, os, tempfile
 import openpyxl
 import backends as B
+import i18n
 from cache import CountCache
+
+# 0) çeviri bütünlüğü — dört dilde de aynı anahtar kümesi olmalı
+ref = set(i18n.load("en"))
+assert ref, "locales/en.json okunamadı"
+for code in i18n.LANGUAGES:
+    keys = set(i18n.load(code))
+    missing, extra = sorted(ref - keys), sorted(keys - ref)
+    assert not missing, f"{code}: eksik anahtar {missing}"
+    assert not extra, f"{code}: fazla anahtar {extra}"
+    blank = sorted(k for k, v in i18n.load(code).items() if not str(v).strip())
+    assert not blank, f"{code}: boş çeviri {blank}"
+print(f"çeviri: {len(i18n.LANGUAGES)} dil × {len(ref)} anahtar, boşluk yok")
 
 # 1) sorgu kurulumu
 syn = {"Citrate": ["citrate", "citric acid"]}
@@ -16,6 +29,7 @@ print("gecikme (anahtarsız/anahtarlı):", pm.limiter.min_interval,
       B.PubMedBackend(api_key="x").limiter.min_interval)
 print("matris tahmini:", [(s, B.guess_matrix_key(s)) for s in
       ["1. Serum-Plazma", "2. Idrar-Urine", "5. BOS-CSF", "4. Feces", "Sheet9"]])
+print("arka uç bilgisi:", pm.info(), ep.info())
 
 # 2) önbellek
 path = os.path.join(tempfile.mkdtemp(), "c.sqlite")
@@ -59,13 +73,21 @@ res = app.run_counts(wb2, {"2. Urine": "urine"}, syn, [a, b], a,
                      {"from_year": None, "to_year": None, "sort": True,
                       "pct_value": True, "ttl": None}, None)
 df = res["previews"]["2. Urine"]
-print(df.to_string(index=False))
+print(app.display_df(df, ["PubMed", "Europe PMC"]).to_string(index=False))
 ws2 = wb2["2. Urine"]
 print("E sütunu (birincil sayım):", [ws2.cell(r, 5).value for r in range(5, 9)])
 print("F sütunu (pay)          :", [round(ws2.cell(r, 6).value, 4) for r in range(5, 9)])
 print("I..L başlıkları         :", [ws2.cell(4, c).value for c in range(9, 13)])
 print("I..L ilk satır          :", [ws2.cell(5, c).value for c in range(9, 13)])
-print("Spearman ρ:", app.spearman(df["PubMed sayı"], df["Europe PMC sayı"]))
-print("ilk 2 örtüşme:", app.topn_overlap(df, "PubMed sayı", "Europe PMC sayı", 2))
+print("Spearman ρ:", app.spearman(df[app.col_count("PubMed")],
+                                 df[app.col_count("Europe PMC")]))
+print("ilk 2 örtüşme:", app.topn_overlap(df, app.col_count("PubMed"),
+                                         app.col_count("Europe PMC"), 2))
+
+# 4) dört dilde sütun başlıkları
+for code in i18n.LANGUAGES:
+    i18n.st.session_state["lang"] = code
+    cols = list(app.display_df(df, ["PubMed", "Europe PMC"]).columns)
+    print(f"  {code}: {cols}")
 assert abs(sum(ws2.cell(r, 6).value for r in range(5, 9)) - 1.0) < 1e-9
 print("\nTÜM TESTLER GEÇTİ")
