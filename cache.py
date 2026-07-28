@@ -71,7 +71,8 @@ class CountCache:
             "SELECT backend, COUNT(*), MIN(fetched_at), MAX(fetched_at) "
             "FROM counts GROUP BY backend ORDER BY backend"
         ).fetchall()
-        return [{"backend": b, "kayıt": n, "en eski": lo, "en yeni": hi}
+        # Anahtarlar dilden bağımsız; arayüz bunları çevirerek gösterir.
+        return [{"backend": b, "records": n, "oldest": lo, "newest": hi}
                 for b, n, lo, hi in rows]
 
     def total(self) -> int:
