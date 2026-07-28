@@ -31,13 +31,9 @@ MATRIX_TERMS = {
     "csf":    ["cerebrospinal fluid", "CSF"],
 }
 
-MATRIX_LABELS = {
-    "serum":  "Serum / Plazma",
-    "urine":  "İdrar",
-    "saliva": "Salya",
-    "feces":  "Gayta",
-    "csf":    "BOS",
-}
+# Etiketler burada değil, locales/<dil>.json içinde ("matrix.serum" vb.):
+# bu modül arayüzden ve dilden bağımsız kalır.
+MATRIX_KEYS = list(MATRIX_TERMS)
 
 # Bağlam terimleri — orijinal betikteki hâliyle korundu (metabolite* joker)
 CONTEXT_TERMS = ["metabolomics", "metabolite*"]
@@ -71,13 +67,13 @@ def _retry_after(resp, fallback: float) -> float:
 
 def _fetch_count(url, params, limiter, extract, retries=4, timeout=30):
     """(sayı, hata) döndürür. 429/503'te Retry-After'a uyar, üstel geri çekilir."""
-    last_err = "bilinmeyen hata"
+    last_err = "unknown error"
     for attempt in range(retries):
         limiter.wait()
         try:
             r = requests.get(url, params=params, timeout=timeout)
             if r.status_code in (429, 503):
-                last_err = f"HTTP {r.status_code} — hız sınırı"
+                last_err = f"HTTP {r.status_code} rate limit"
                 time.sleep(_retry_after(r, 2.0 ** attempt))
                 continue
             r.raise_for_status()
@@ -101,8 +97,9 @@ class Backend:
     def count(self, query):
         raise NotImplementedError
 
-    def describe(self) -> str:
-        return self.name
+    def info(self) -> dict:
+        """Arayüzün çevireceği, dilden bağımsız durum bilgisi."""
+        return {"name": self.name}
 
 
 class PubMedBackend(Backend):
@@ -141,8 +138,8 @@ class PubMedBackend(Backend):
         return _fetch_count(EUTILS_URL, params, self.limiter,
                             lambda j: int(j["esearchresult"]["count"]))
 
-    def describe(self):
-        return f"PubMed ({'anahtarlı' if self.api_key else 'anahtarsız'})"
+    def info(self):
+        return {"name": self.name, "keyed": bool(self.api_key)}
 
 
 class EuropePMCBackend(Backend):
@@ -200,11 +197,9 @@ class EuropePMCBackend(Backend):
         return _fetch_count(EPMC_URL, params, self.limiter,
                             lambda j: int(j["hitCount"]))
 
-    def describe(self):
-        bits = [f"synonym={'açık' if self.synonym else 'kapalı'}"]
-        if self.restrict_medline:
-            bits.append("SRC:MED")
-        return f"Europe PMC ({', '.join(bits)})"
+    def info(self):
+        return {"name": self.name, "synonym": self.synonym,
+                "medline": self.restrict_medline}
 
 
 def guess_matrix_key(sheet_name: str) -> str:
